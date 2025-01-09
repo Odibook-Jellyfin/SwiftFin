@@ -1,73 +1,108 @@
 //
-/*
- * SwiftFin is subject to the terms of the Mozilla Public
- * License, v2.0. If a copy of the MPL was not distributed with this
- * file, you can obtain one at https://mozilla.org/MPL/2.0/.
- *
- * Copyright 2021 Aiden Vigue & Jellyfin Contributors
- */
+// Swiftfin is subject to the terms of the Mozilla Public
+// License, v2.0. If a copy of the MPL was not distributed with this
+// file, you can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2025 Jellyfin & Jellyfin Contributors
+//
 
 import Combine
 import Defaults
+import Factory
 import Foundation
+import JellyfinAPI
 import Nuke
 import Stinsen
 import SwiftUI
-import WidgetKit
+
+// TODO: could possibly clean up
+//       - only go to loading if migrations necessary
+//       - account for other migrations (Defaults)
 
 final class MainCoordinator: NavigationCoordinatable {
-    var stack: NavigationStack<MainCoordinator>
 
-    @Root var mainTab = makeMainTab
-    @Root var serverList = makeServerList
-    
-    private var cancellables = Set<AnyCancellable>()
+    @Injected(\.logService)
+    private var logger
+
+    var stack: Stinsen.NavigationStack<MainCoordinator>
+
+    @Root
+    var loading = makeLoading
+    @Root
+    var mainTab = makeMainTab
+    @Root
+    var selectUser = makeSelectUser
+    @Root
+    var serverCheck = makeServerCheck
+
+    @Route(.fullScreen)
+    var liveVideoPlayer = makeLiveVideoPlayer
+    @Route(.modal)
+    var settings = makeSettings
+    @Route(.fullScreen)
+    var videoPlayer = makeVideoPlayer
 
     init() {
-        if SessionManager.main.currentLogin != nil {
-            self.stack = NavigationStack(initial: \MainCoordinator.mainTab)
-        } else {
-            self.stack = NavigationStack(initial: \MainCoordinator.serverList)
+
+        stack = NavigationStack(initial: \.loading)
+
+        Task {
+            do {
+                try await SwiftfinStore.setupDataStack()
+
+                if Container.shared.currentUserSession() != nil, !Defaults[.signOutOnClose] {
+                    await MainActor.run {
+                        withAnimation(.linear(duration: 0.1)) {
+                            let _ = root(\.serverCheck)
+                        }
+                    }
+                } else {
+                    await MainActor.run {
+                        withAnimation(.linear(duration: 0.1)) {
+                            let _ = root(\.selectUser)
+                        }
+                    }
+                }
+
+            } catch {
+                await MainActor.run {
+                    logger.critical("\(error.localizedDescription)")
+                    Notifications[.didFailMigration].post()
+                }
+            }
         }
 
-        ImageCache.shared.costLimit = 125 * 1024 * 1024 // 125MB memory
-        DataLoader.sharedUrlCache.diskCapacity = 1000 * 1024 * 1024 // 1000MB disk
-
-        WidgetCenter.shared.reloadAllTimelines()
-        UIScrollView.appearance().keyboardDismissMode = .onDrag
-
-        // Back bar button item setup
-        let backButtonBackgroundImage = UIImage(systemName: "chevron.backward.circle.fill")
-        let barAppearance = UINavigationBar.appearance()
-        barAppearance.backIndicatorImage = backButtonBackgroundImage
-        barAppearance.backIndicatorTransitionMaskImage = backButtonBackgroundImage
-        barAppearance.tintColor = UIColor(Color.jellyfinPurple)
+        // TODO: move these to the App instead?
 
         // Notification setup for state
-        let nc = SwiftfinNotificationCenter.main
-        nc.addObserver(self, selector: #selector(didLogIn), name: SwiftfinNotificationCenter.Keys.didSignIn, object: nil)
-        nc.addObserver(self, selector: #selector(didLogOut), name: SwiftfinNotificationCenter.Keys.didSignOut, object: nil)
-        nc.addObserver(self, selector: #selector(processDeepLink), name: SwiftfinNotificationCenter.Keys.processDeepLink, object: nil)
-        nc.addObserver(self, selector: #selector(didChangeServerCurrentURI), name: SwiftfinNotificationCenter.Keys.didChangeServerCurrentURI, object: nil)
-        
-        Defaults.publisher(.appAppearance)
-            .sink { _ in
-                JellyfinPlayerApp.setupAppearance()
-            }
-            .store(in: &cancellables)
+        Notifications[.didSignIn].subscribe(self, selector: #selector(didSignIn))
+        Notifications[.didSignOut].subscribe(self, selector: #selector(didSignOut))
+        Notifications[.processDeepLink].subscribe(self, selector: #selector(processDeepLink(_:)))
+        Notifications[.didChangeCurrentServerURL].subscribe(self, selector: #selector(didChangeCurrentServerURL(_:)))
     }
 
-    @objc func didLogIn() {
-        LogManager.shared.log.info("Received `didSignIn` from SwiftfinNotificationCenter.")
-        root(\.mainTab)
+    private func didFinishMigration() {}
+
+    @objc
+    func didSignIn() {
+        logger.info("Signed in")
+
+        withAnimation(.linear(duration: 0.1)) {
+            let _ = root(\.serverCheck)
+        }
     }
 
-    @objc func didLogOut() {
-        LogManager.shared.log.info("Received `didSignOut` from SwiftfinNotificationCenter.")
-        root(\.serverList)
+    @objc
+    func didSignOut() {
+        logger.info("Signed out")
+
+        withAnimation(.linear(duration: 0.1)) {
+            let _ = root(\.selectUser)
+        }
     }
 
-    @objc func processDeepLink(_ notification: Notification) {
+    @objc
+    func processDeepLink(_ notification: Notification) {
         guard let deepLink = notification.object as? DeepLink else { return }
         if let coordinator = hasRoot(\.mainTab) {
             switch deepLink {
@@ -80,19 +115,44 @@ final class MainCoordinator: NavigationCoordinatable {
         }
     }
 
-    @objc func didChangeServerCurrentURI(_ notification: Notification) {
-        guard let newCurrentServerState = notification.object as? SwiftfinStore.State.Server else { fatalError("Need to have new current login state server") }
-        guard SessionManager.main.currentLogin != nil else { return }
-        if newCurrentServerState.id == SessionManager.main.currentLogin.server.id {
-            SessionManager.main.loginUser(server: newCurrentServerState, user: SessionManager.main.currentLogin.user)
+    @objc
+    func didChangeCurrentServerURL(_ notification: Notification) {
+
+        guard Container.shared.currentUserSession() != nil else { return }
+
+        Container.shared.currentUserSession.reset()
+        Notifications[.didSignIn].post()
+    }
+
+    func makeLoading() -> NavigationViewCoordinator<BasicNavigationViewCoordinator> {
+        NavigationViewCoordinator {
+            AppLoadingView()
         }
+    }
+
+    func makeSettings() -> NavigationViewCoordinator<SettingsCoordinator> {
+        NavigationViewCoordinator(SettingsCoordinator())
     }
 
     func makeMainTab() -> MainTabCoordinator {
         MainTabCoordinator()
     }
 
-    func makeServerList() -> NavigationViewCoordinator<ServerListCoordinator> {
-        NavigationViewCoordinator(ServerListCoordinator())
+    func makeSelectUser() -> NavigationViewCoordinator<SelectUserCoordinator> {
+        NavigationViewCoordinator(SelectUserCoordinator())
+    }
+
+    func makeServerCheck() -> NavigationViewCoordinator<BasicNavigationViewCoordinator> {
+        NavigationViewCoordinator {
+            ServerCheckView()
+        }
+    }
+
+    func makeVideoPlayer(manager: VideoPlayerManager) -> VideoPlayerCoordinator {
+        VideoPlayerCoordinator(manager: manager)
+    }
+
+    func makeLiveVideoPlayer(manager: LiveVideoPlayerManager) -> LiveVideoPlayerCoordinator {
+        LiveVideoPlayerCoordinator(manager: manager)
     }
 }

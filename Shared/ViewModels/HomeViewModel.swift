@@ -1,156 +1,228 @@
 //
-/*
- * SwiftFin is subject to the terms of the Mozilla Public
- * License, v2.0. If a copy of the MPL was not distributed with this
- * file, you can obtain one at https://mozilla.org/MPL/2.0/.
- *
- * Copyright 2021 Aiden Vigue & Jellyfin Contributors
- */
+// Swiftfin is subject to the terms of the Mozilla Public
+// License, v2.0. If a copy of the MPL was not distributed with this
+// file, you can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2025 Jellyfin & Jellyfin Contributors
+//
 
-import ActivityIndicator
 import Combine
-import Foundation
+import CoreStore
+import Factory
+import Get
 import JellyfinAPI
+import OrderedCollections
 
-final class HomeViewModel: ViewModel {
+final class HomeViewModel: ViewModel, Stateful {
 
-    @Published var librariesShowRecentlyAddedIDs: [String] = []
-    @Published var libraries: [BaseItemDto] = []
-    @Published var resumeItems: [BaseItemDto] = []
-    @Published var nextUpItems: [BaseItemDto] = []
+    // MARK: Action
 
-    // temp
-    var recentFilterSet: LibraryFilters = LibraryFilters(filters: [], sortOrder: [.descending], sortBy: [.dateAdded])
+    enum Action: Equatable {
+        case backgroundRefresh
+        case error(JellyfinAPIError)
+        case setIsPlayed(Bool, BaseItemDto)
+        case refresh
+    }
+
+    // MARK: BackgroundState
+
+    enum BackgroundState: Hashable {
+        case refresh
+    }
+
+    // MARK: State
+
+    enum State: Hashable {
+        case content
+        case error(JellyfinAPIError)
+        case initial
+        case refreshing
+    }
+
+    @Published
+    private(set) var libraries: [LatestInLibraryViewModel] = []
+    @Published
+    var resumeItems: OrderedSet<BaseItemDto> = []
+
+    @Published
+    var backgroundStates: OrderedSet<BackgroundState> = []
+    @Published
+    var lastAction: Action? = nil
+    @Published
+    var state: State = .initial
+
+    // TODO: replace with views checking what notifications were
+    //       posted since last disappear
+    @Published
+    var notificationsReceived: NotificationSet = .init()
+
+    private var backgroundRefreshTask: AnyCancellable?
+    private var refreshTask: AnyCancellable?
+
+    var nextUpViewModel: NextUpLibraryViewModel = .init()
+    var recentlyAddedViewModel: RecentlyAddedLibraryViewModel = .init()
 
     override init() {
         super.init()
-        refresh()
 
-        // Nov. 6, 2021
-        // This is a workaround since Stinsen doesn't have the ability to rebuild a root at the time of writing.
-        // See ServerDetailViewModel.swift for feature request issue
-        let nc = SwiftfinNotificationCenter.main
-        nc.addObserver(self, selector: #selector(didSignIn), name: SwiftfinNotificationCenter.Keys.didSignIn, object: nil)
-        nc.addObserver(self, selector: #selector(didSignOut), name: SwiftfinNotificationCenter.Keys.didSignOut, object: nil)
-    }
-
-    @objc private func didSignIn() {
-        for cancellable in cancellables {
-            cancellable.cancel()
-        }
-
-        librariesShowRecentlyAddedIDs = []
-        libraries = []
-        resumeItems = []
-        nextUpItems = []
-
-        refresh()
-    }
-
-    @objc private func didSignOut() {
-        for cancellable in cancellables {
-            cancellable.cancel()
-        }
-
-        cancellables.removeAll()
-    }
-
-    @objc func refresh() {
-        LogManager.shared.log.debug("Refresh called.")
-        
-        refreshLibrariesLatest()
-        refreshResumeItems()
-        refreshNextUpItems()
-    }
-    
-    // MARK: Libraries Latest Items
-    private func refreshLibrariesLatest() {
-        UserViewsAPI.getUserViews(userId: SessionManager.main.currentLogin.user.id)
-            .trackActivity(loading)
-            .sink(receiveCompletion: { completion in
-                switch completion {
-                case .finished: ()
-                case .failure:
-                    self.libraries = []
+        Notifications[.itemMetadataDidChange]
+            .publisher
+            .sink { _ in
+                // Necessary because when this notification is posted, even with asyncAfter,
+                // the view will cause layout issues since it will redraw while in landscape.
+                // TODO: look for better solution
+                DispatchQueue.main.async {
+                    self.notificationsReceived.insert(.itemMetadataDidChange)
                 }
-                
-                self.handleAPIRequestError(completion: completion)
-            }, receiveValue: { response in
+            }
+            .store(in: &cancellables)
+    }
 
-                var newLibraries: [BaseItemDto] = []
+    func respond(to action: Action) -> State {
+        switch action {
+        case .backgroundRefresh:
 
-                response.items!.forEach { item in
-                    LogManager.shared.log.debug("Retrieved user view: \(item.id!) (\(item.name ?? "nil")) with type \(item.collectionType ?? "nil")")
-                    if item.collectionType == "movies" || item.collectionType == "tvshows" {
-                        newLibraries.append(item)
+            backgroundRefreshTask?.cancel()
+            backgroundStates.append(.refresh)
+
+            backgroundRefreshTask = Task { [weak self] in
+                do {
+                    self?.nextUpViewModel.send(.refresh)
+                    self?.recentlyAddedViewModel.send(.refresh)
+
+                    let resumeItems = try await self?.getResumeItems() ?? []
+
+                    guard !Task.isCancelled else { return }
+
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.resumeItems.elements = resumeItems
+                        self.backgroundStates.remove(.refresh)
+                    }
+                } catch is CancellationError {
+                    // cancelled
+                } catch {
+                    guard !Task.isCancelled else { return }
+
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.backgroundStates.remove(.refresh)
+                        self.send(.error(.init(error.localizedDescription)))
                     }
                 }
+            }
+            .asAnyCancellable()
 
-                UserAPI.getCurrentUser()
-                    .trackActivity(self.loading)
-                    .sink(receiveCompletion: { completion in
-                        switch completion {
-                        case .finished: ()
-                        case .failure:
-                            self.libraries = []
-                            self.handleAPIRequestError(completion: completion)
-                        }
-                    }, receiveValue: { response in
-                        let excludeIDs = response.configuration?.latestItemsExcludes != nil ? response.configuration!.latestItemsExcludes! : []
+            return state
+        case let .error(error):
+            return .error(error)
+        case let .setIsPlayed(isPlayed, item): ()
+            Task {
+                try await setIsPlayed(isPlayed, for: item)
 
-                        for excludeID in excludeIDs {
-                            newLibraries.removeAll { library in
-                                return library.id == excludeID
-                            }
-                        }
-
-                        self.libraries = newLibraries
-                    })
-                    .store(in: &self.cancellables)
-            })
+                self.send(.backgroundRefresh)
+            }
             .store(in: &cancellables)
-    }
-    
-    // MARK: Resume Items
-    private func refreshResumeItems() {
-        ItemsAPI.getResumeItems(userId: SessionManager.main.currentLogin.user.id, limit: 12,
-                                fields: [.primaryImageAspectRatio, .seriesPrimaryImage, .seasonUserData, .overview, .genres, .people, .chapters],
-                                mediaTypes: ["Video"],
-                                imageTypeLimit: 1,
-                                enableImageTypes: [.primary, .backdrop, .thumb])
-            .trackActivity(loading)
-            .sink(receiveCompletion: { completion in
-                switch completion {
-                case .finished: ()
-                case .failure:
-                    self.resumeItems = []
-                    self.handleAPIRequestError(completion: completion)
+
+            return state
+        case .refresh:
+            backgroundRefreshTask?.cancel()
+            refreshTask?.cancel()
+
+            refreshTask = Task { [weak self] in
+                do {
+                    try await self?.refresh()
+
+                    guard !Task.isCancelled else { return }
+
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.state = .content
+                    }
+                } catch is CancellationError {
+                    // cancelled
+                } catch {
+                    guard !Task.isCancelled else { return }
+
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.send(.error(.init(error.localizedDescription)))
+                    }
                 }
-            }, receiveValue: { response in
-                LogManager.shared.log.debug("Retrieved \(String(response.items!.count)) resume items")
+            }
+            .asAnyCancellable()
 
-                self.resumeItems = response.items ?? []
-            })
-            .store(in: &cancellables)
+            return .refreshing
+        }
     }
-    
-    // MARK: Next Up Items
-    private func refreshNextUpItems() {
-        TvShowsAPI.getNextUp(userId: SessionManager.main.currentLogin.user.id, limit: 12,
-                             fields: [.primaryImageAspectRatio, .seriesPrimaryImage, .seasonUserData, .overview, .genres, .people, .chapters])
-            .trackActivity(loading)
-            .sink(receiveCompletion: { completion in
-                switch completion {
-                case .finished: ()
-                case .failure:
-                    self.nextUpItems = []
-                    self.handleAPIRequestError(completion: completion)
-                }
-            }, receiveValue: { response in
-                LogManager.shared.log.debug("Retrieved \(String(response.items!.count)) nextup items")
 
-                self.nextUpItems = response.items ?? []
-            })
-            .store(in: &cancellables)
+    private func refresh() async throws {
+
+        await nextUpViewModel.send(.refresh)
+        await recentlyAddedViewModel.send(.refresh)
+
+        let resumeItems = try await getResumeItems()
+        let libraries = try await getLibraries()
+
+        for library in libraries {
+            await library.send(.refresh)
+        }
+
+        await MainActor.run {
+            self.resumeItems.elements = resumeItems
+            self.libraries = libraries
+        }
+    }
+
+    private func getResumeItems() async throws -> [BaseItemDto] {
+        var parameters = Paths.GetResumeItemsParameters()
+        parameters.enableUserData = true
+        parameters.fields = .MinimumFields
+        parameters.includeItemTypes = [.movie, .episode]
+        parameters.limit = 20
+
+        let request = Paths.getResumeItems(userID: userSession.user.id, parameters: parameters)
+        let response = try await userSession.client.send(request)
+
+        return response.value.items ?? []
+    }
+
+    private func getLibraries() async throws -> [LatestInLibraryViewModel] {
+
+        let userViewsPath = Paths.getUserViews(userID: userSession.user.id)
+        async let userViews = userSession.client.send(userViewsPath)
+
+        async let excludedLibraryIDs = getExcludedLibraries()
+
+        return try await (userViews.value.items ?? [])
+            .intersection(["movies", "tvshows"], using: \.collectionType)
+            .subtracting(excludedLibraryIDs, using: \.id)
+            .map { LatestInLibraryViewModel(parent: $0) }
+    }
+
+    // TODO: use the more updated server/user data when implemented
+    private func getExcludedLibraries() async throws -> [String] {
+        let currentUserPath = Paths.getCurrentUser
+        let response = try await userSession.client.send(currentUserPath)
+
+        return response.value.configuration?.latestItemsExcludes ?? []
+    }
+
+    private func setIsPlayed(_ isPlayed: Bool, for item: BaseItemDto) async throws {
+        let request: Request<UserItemDataDto>
+
+        if isPlayed {
+            request = Paths.markPlayedItem(
+                userID: userSession.user.id,
+                itemID: item.id!
+            )
+        } else {
+            request = Paths.markUnplayedItem(
+                userID: userSession.user.id,
+                itemID: item.id!
+            )
+        }
+
+        let _ = try await userSession.client.send(request)
     }
 }

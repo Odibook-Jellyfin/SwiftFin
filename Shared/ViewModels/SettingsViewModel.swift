@@ -1,48 +1,96 @@
 //
-/*
- * SwiftFin is subject to the terms of the Mozilla Public
- * License, v2.0. If a copy of the MPL was not distributed with this
- * file, you can obtain one at https://mozilla.org/MPL/2.0/.
- *
- * Copyright 2021 Aiden Vigue & Jellyfin Contributors
- */
+// Swiftfin is subject to the terms of the Mozilla Public
+// License, v2.0. If a copy of the MPL was not distributed with this
+// file, you can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2025 Jellyfin & Jellyfin Contributors
+//
 
-import Foundation
-import SwiftUI
+import CoreStore
 import Defaults
+import Factory
+import Files
+import Foundation
+import JellyfinAPI
+import UIKit
 
-final class SettingsViewModel: ObservableObject {
-    
-    var bitrates: [Bitrates] = []
-    var langs: [TrackLanguage] = []
-    
-    let server: SwiftfinStore.State.Server
-    let user: SwiftfinStore.State.User
+// TODO: should probably break out into a `Settings` and `AppSettings` view models
+//       - could clean up all settings view models
 
-    init(server: SwiftfinStore.State.Server, user: SwiftfinStore.State.User) {
-        
-        self.server = server
-        self.user = user
-        
-        // Bitrates
-        let url = Bundle.main.url(forResource: "bitrates", withExtension: "json")!
+final class SettingsViewModel: ViewModel {
 
-        do {
-            let jsonData = try Data(contentsOf: url, options: .mappedIfSafe)
-            do {
-                self.bitrates = try JSONDecoder().decode([Bitrates].self, from: jsonData)
-            } catch {
-                LogManager.shared.log.error("Error converting processed JSON into Swift compatible schema.")
-            }
-        } catch {
-            LogManager.shared.log.error("Error processing JSON file `bitrates.json`")
+    @Published
+    var currentAppIcon: any AppIcon = PrimaryAppIcon.primary
+    @Published
+    var servers: [ServerState] = []
+
+    override init() {
+
+        guard let iconName = UIApplication.shared.alternateIconName else {
+            currentAppIcon = PrimaryAppIcon.primary
+            super.init()
+            return
         }
 
-        // Track languages
-        self.langs = Locale.isoLanguageCodes.compactMap {
-            guard let name = Locale.current.localizedString(forLanguageCode: $0) else { return nil }
-            return TrackLanguage(name: name, isoCode: $0)
-        }.sorted(by: { $0.name < $1.name })
-        self.langs.insert(.auto, at: 0)
+        if let appicon = PrimaryAppIcon.createCase(iconName: iconName) {
+            currentAppIcon = appicon
+        }
+
+        if let appicon = DarkAppIcon.createCase(iconName: iconName) {
+            currentAppIcon = appicon
+        }
+
+        if let appicon = InvertedDarkAppIcon.createCase(iconName: iconName) {
+            currentAppIcon = appicon
+        }
+
+        if let appicon = InvertedLightAppIcon.createCase(iconName: iconName) {
+            currentAppIcon = appicon
+        }
+
+        if let appicon = LightAppIcon.createCase(iconName: iconName) {
+            currentAppIcon = appicon
+        }
+
+        super.init()
+
+        do {
+            servers = try getServers()
+        } catch {
+            logger.critical("Could not retrieve servers")
+        }
+    }
+
+    func select(icon: any AppIcon) {
+        let previousAppIcon = currentAppIcon
+        currentAppIcon = icon
+
+        Task { @MainActor in
+
+            do {
+                if case PrimaryAppIcon.primary = icon {
+                    try await UIApplication.shared.setAlternateIconName(nil)
+                } else {
+                    try await UIApplication.shared.setAlternateIconName(icon.iconName)
+                }
+            } catch {
+                logger.error("Unable to update app icon to \(icon.iconName): \(error.localizedDescription)")
+                currentAppIcon = previousAppIcon
+            }
+        }
+    }
+
+    private func getServers() throws -> [ServerState] {
+        try SwiftfinStore
+            .dataStack
+            .fetchAll(From<ServerModel>())
+            .map(\.state)
+            .sorted(using: \.name)
+    }
+
+    func signOut() {
+        Defaults[.lastSignedInUserID] = .signedOut
+        Container.shared.currentUserSession.reset()
+        Notifications[.didSignOut].post()
     }
 }

@@ -12,6 +12,7 @@ dynatraceSymbols.zip
 Cartfile.resolved
 Gemfile.lock
 dynatrace/
+Carthage
 
 ## Various settings
 *.pbxuser
@@ -97,3 +98,5 @@ iOSInjectionProject/
 ehthumbs.db
 Thumbs.db
 Shared/Generated/Strings.swift
+
+.idea

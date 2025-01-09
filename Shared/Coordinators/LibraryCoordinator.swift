@@ -1,56 +1,68 @@
 //
-/*
- * SwiftFin is subject to the terms of the Mozilla Public
- * License, v2.0. If a copy of the MPL was not distributed with this
- * file, you can obtain one at https://mozilla.org/MPL/2.0/.
- *
- * Copyright 2021 Aiden Vigue & Jellyfin Contributors
- */
+// Swiftfin is subject to the terms of the Mozilla Public
+// License, v2.0. If a copy of the MPL was not distributed with this
+// file, you can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2025 Jellyfin & Jellyfin Contributors
+//
 
+import Defaults
 import Foundation
 import JellyfinAPI
 import Stinsen
 import SwiftUI
 
-typealias LibraryCoordinatorParams = (viewModel: LibraryViewModel, title: String)
-
-final class LibraryCoordinator: NavigationCoordinatable {
+final class LibraryCoordinator<Element: Poster>: NavigationCoordinatable {
 
     let stack = NavigationStack(initial: \LibraryCoordinator.start)
 
-    @Root var start = makeStart
-    @Route(.push) var search = makeSearch
-    @Route(.modal) var filter = makeFilter
-    @Route(.push) var item = makeItem
-    @Route(.modal) var modalItem = makeModalItem
+    @Root
+    var start = makeStart
 
-    let viewModel: LibraryViewModel
-    let title: String
+    #if os(tvOS)
+    @Route(.modal)
+    var item = makeItem
+    @Route(.push)
+    var library = makeLibrary
+    #else
+    @Route(.push)
+    var item = makeItem
+    @Route(.push)
+    var library = makeLibrary
+    @Route(.modal)
+    var filter = makeFilter
+    #endif
 
-    init(viewModel: LibraryViewModel, title: String) {
+    private let viewModel: PagingLibraryViewModel<Element>
+
+    init(viewModel: PagingLibraryViewModel<Element>) {
         self.viewModel = viewModel
-        self.title = title
     }
 
-    @ViewBuilder func makeStart() -> some View {
-        LibraryView(viewModel: self.viewModel, title: title)
+    @ViewBuilder
+    func makeStart() -> some View {
+        PagingLibraryView(viewModel: viewModel)
     }
 
-    func makeSearch(viewModel: LibrarySearchViewModel) -> SearchCoordinator {
-        SearchCoordinator(viewModel: viewModel)
+    #if os(tvOS)
+    func makeItem(item: BaseItemDto) -> NavigationViewCoordinator<ItemCoordinator> {
+        NavigationViewCoordinator(ItemCoordinator(item: item))
     }
 
-    func makeFilter(params: FilterCoordinatorParams) -> NavigationViewCoordinator<FilterCoordinator> {
-        NavigationViewCoordinator(FilterCoordinator(filters: params.filters,
-                                                    enabledFilterType: params.enabledFilterType,
-                                                    parentId: params.parentId))
+    func makeLibrary(viewModel: PagingLibraryViewModel<BaseItemDto>) -> NavigationViewCoordinator<LibraryCoordinator<BaseItemDto>> {
+        NavigationViewCoordinator(LibraryCoordinator<BaseItemDto>(viewModel: viewModel))
     }
-
+    #else
     func makeItem(item: BaseItemDto) -> ItemCoordinator {
         ItemCoordinator(item: item)
     }
 
-    func makeModalItem(item: BaseItemDto) -> NavigationViewCoordinator<ItemCoordinator> {
-        return NavigationViewCoordinator(ItemCoordinator(item: item))
+    func makeLibrary(viewModel: PagingLibraryViewModel<BaseItemDto>) -> LibraryCoordinator<BaseItemDto> {
+        LibraryCoordinator<BaseItemDto>(viewModel: viewModel)
     }
+
+    func makeFilter(parameters: FilterCoordinator.Parameters) -> NavigationViewCoordinator<FilterCoordinator> {
+        NavigationViewCoordinator(FilterCoordinator(parameters: parameters))
+    }
+    #endif
 }

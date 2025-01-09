@@ -1,126 +1,241 @@
 //
-/*
- * SwiftFin is subject to the terms of the Mozilla Public
- * License, v2.0. If a copy of the MPL was not distributed with this
- * file, you can obtain one at https://mozilla.org/MPL/2.0/.
- *
- * Copyright 2021 Aiden Vigue & Jellyfin Contributors
- */
+// Swiftfin is subject to the terms of the Mozilla Public
+// License, v2.0. If a copy of the MPL was not distributed with this
+// file, you can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2025 Jellyfin & Jellyfin Contributors
+//
 
 import Combine
+import CoreStore
+import Factory
 import Foundation
+import Get
 import JellyfinAPI
-import Stinsen
+import OrderedCollections
+import Pulse
 
-struct AddServerURIPayload: Identifiable {
+final class ConnectToServerViewModel: ViewModel, Eventful, Stateful {
 
-    let server: SwiftfinStore.State.Server
-    let uri: String
+    // MARK: Event
 
-    var id: String {
-        return server.id.appending(uri)
+    enum Event {
+        case connected(ServerState)
+        case duplicateServer(ServerState)
+        case error(JellyfinAPIError)
     }
-}
 
-final class ConnectToServerViewModel: ViewModel {
+    // MARK: Action
 
-    @RouterObject var router: ConnectToServerCoodinator.Router?
-    @Published var discoveredServers: Set<ServerDiscovery.ServerLookupResponse> = []
-    @Published var searching = false
-    @Published var addServerURIPayload: AddServerURIPayload?
-    var backAddServerURIPayload: AddServerURIPayload?
+    enum Action: Equatable {
+        case addNewURL(ServerState)
+        case cancel
+        case connect(String)
+        case searchForServers
+    }
 
+    // MARK: BackgroundState
+
+    enum BackgroundState: Hashable {
+        case searching
+    }
+
+    // MARK: State
+
+    enum State: Hashable {
+        case connecting
+        case initial
+    }
+
+    @Published
+    var backgroundStates: OrderedSet<BackgroundState> = []
+
+    // no longer-found servers are not cleared, but not an issue
+    @Published
+    var localServers: OrderedSet<ServerState> = []
+    @Published
+    var state: State = .initial
+
+    var events: AnyPublisher<Event, Never> {
+        eventSubject
+            .receive(on: RunLoop.main)
+            .eraseToAnyPublisher()
+    }
+
+    private var connectTask: AnyCancellable? = nil
     private let discovery = ServerDiscovery()
+    private var eventSubject: PassthroughSubject<Event, Never> = .init()
 
-    var alertTitle: String {
-        var message: String = ""
-        if errorMessage?.code != ErrorMessage.noShowErrorCode {
-            message.append(contentsOf: "\(errorMessage?.code ?? ErrorMessage.noShowErrorCode)\n")
-        }
-        message.append(contentsOf: "\(errorMessage?.title ?? "Unkown Error")")
-        return message
+    deinit {
+        discovery.close()
     }
 
-    func connectToServer(uri: String) {
-        #if targetEnvironment(simulator)
-        var uri = uri
-        if uri == "localhost" {
-            uri = "http://localhost:8096"
-        }
-        #endif
-        
-        let trimmedURI = uri.trimmingCharacters(in: .whitespaces)
+    override init() {
+        super.init()
 
-        LogManager.shared.log.debug("Attempting to connect to server at \"\(trimmedURI)\"", tag: "connectToServer")
-        SessionManager.main.connectToServer(with: trimmedURI)
-            .trackActivity(loading)
-            .sink(receiveCompletion: { completion in
-                // This is disgusting. ViewModel Error handling overall needs to be refactored
-                switch completion {
-                case .finished: ()
-                case .failure(let error):
-                    switch error {
-                    case is SwiftfinStore.Errors:
-                        let swiftfinError = error as! SwiftfinStore.Errors
-                        switch swiftfinError {
-                        case .existingServer(let server):
-                            self.addServerURIPayload = AddServerURIPayload(server: server, uri: uri)
-                            self.backAddServerURIPayload = AddServerURIPayload(server: server, uri: uri)
-                        default:
-                            self.handleAPIRequestError(displayMessage: "Unable to connect to server.", logLevel: .critical, tag: "connectToServer",
-                                                       completion: completion)
+        Task { [weak self] in
+            guard let self else { return }
+
+            for await response in discovery.discoveredServers.values {
+                await MainActor.run {
+                    let _ = self.localServers.append(response.asServerState)
+                }
+            }
+        }
+        .store(in: &cancellables)
+    }
+
+    func respond(to action: Action) -> State {
+        switch action {
+        case let .addNewURL(server):
+            addNewURL(server: server)
+
+            return state
+        case .cancel:
+            connectTask?.cancel()
+
+            return .initial
+        case let .connect(url):
+            connectTask?.cancel()
+
+            connectTask = Task {
+                do {
+                    let server = try await connectToServer(url: url)
+
+                    if isDuplicate(server: server) {
+                        await MainActor.run {
+                            // server has same id, but (possible) new URL
+                            self.eventSubject.send(.duplicateServer(server))
                         }
-                    default:
-                        self.handleAPIRequestError(displayMessage: "Unable to connect to server.", logLevel: .critical, tag: "connectToServer",
-                                                   completion: completion)
+                    } else {
+                        try await save(server: server)
+
+                        await MainActor.run {
+                            self.eventSubject.send(.connected(server))
+                        }
+                    }
+
+                    await MainActor.run {
+                        self.state = .initial
+                    }
+                } catch is CancellationError {
+                    // cancel doesn't matter
+                } catch {
+                    await MainActor.run {
+                        self.eventSubject.send(.error(.init(error.localizedDescription)))
+                        self.state = .initial
                     }
                 }
-            }, receiveValue: { server in
-                LogManager.shared.log.debug("Connected to server at \"\(uri)\"", tag: "connectToServer")
-                self.router?.route(to: \.userSignIn, server)
-            })
-            .store(in: &cancellables)
-    }
-
-    func discoverServers() {
-        discoveredServers.removeAll()
-        searching = true
-
-        // Timeout after 3 seconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            self.searching = false
-        }
-
-        discovery.locateServer { [self] server in
-            if let server = server {
-                discoveredServers.insert(server)
             }
+            .asAnyCancellable()
+
+            return .connecting
+        case .searchForServers:
+            discovery.broadcast()
+
+            return state
         }
     }
 
-    func addURIToServer(addServerURIPayload: AddServerURIPayload) {
-        SessionManager.main.addURIToServer(server: addServerURIPayload.server, uri: addServerURIPayload.uri)
-            .sink { completion in
-                self.handleAPIRequestError(displayMessage: "Unable to connect to server.", logLevel: .critical, tag: "connectToServer",
-                                           completion: completion)
-            } receiveValue: { server in
-                SessionManager.main.setServerCurrentURI(server: server, uri: addServerURIPayload.uri)
-                    .sink { completion in
-                        self.handleAPIRequestError(displayMessage: "Unable to connect to server.", logLevel: .critical, tag: "connectToServer",
-                                                   completion: completion)
-                    } receiveValue: { _ in
-                        self.router?.dismissCoordinator()
-                    }
-                    .store(in: &self.cancellables)
+    private func connectToServer(url: String) async throws -> ServerState {
+
+        let formattedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: .objectReplacement)
+            .trimmingCharacters(in: ["/"])
+            .prepending("http://", if: !url.contains("://"))
+
+        guard let url = URL(string: formattedURL) else { throw JellyfinAPIError("Invalid URL") }
+
+        let client = JellyfinClient(
+            configuration: .swiftfinConfiguration(url: url),
+            sessionDelegate: URLSessionProxyDelegate(logger: Container.shared.pulseNetworkLogger())
+        )
+
+        let response = try await client.send(Paths.getPublicSystemInfo)
+
+        guard let name = response.value.serverName,
+              let id = response.value.id
+        else {
+            logger.critical("Missing server data from network call")
+            throw JellyfinAPIError("An internal error has occurred")
+        }
+
+        let connectionURL = processConnectionURL(
+            initial: url,
+            response: response.response.url
+        )
+
+        let newServerState = ServerState(
+            urls: [connectionURL],
+            currentURL: connectionURL,
+            name: name,
+            id: id,
+            usersIDs: []
+        )
+
+        return newServerState
+    }
+
+    // In the event of redirects, get the new host URL from response
+    private func processConnectionURL(initial url: URL, response: URL?) -> URL {
+
+        guard let response else { return url }
+
+        if url.scheme != response.scheme ||
+            url.host != response.host
+        {
+            let newURL = response.absoluteString.trimmingSuffix(
+                Paths.getPublicSystemInfo.url?.absoluteString ?? ""
+            )
+            return URL(string: newURL) ?? url
+        }
+
+        return url
+    }
+
+    private func isDuplicate(server: ServerState) -> Bool {
+        let existingServer = try? SwiftfinStore
+            .dataStack
+            .fetchOne(From<ServerModel>().where(\.$id == server.id))
+        return existingServer != nil
+    }
+
+    private func save(server: ServerState) async throws {
+
+        let publicInfo = try await server.getPublicSystemInfo()
+
+        try dataStack.perform { transaction in
+            let newServer = transaction.create(Into<ServerModel>())
+
+            newServer.urls = server.urls
+            newServer.currentURL = server.currentURL
+            newServer.name = server.name
+            newServer.id = server.id
+            newServer.users = []
+        }
+
+        StoredValues[.Server.publicInfo(id: server.id)] = publicInfo
+    }
+
+    // server has same id, but (possible) new URL
+    private func addNewURL(server: ServerState) {
+        do {
+            let newState = try dataStack.perform { transaction in
+                let existingServer = try self.dataStack.fetchOne(From<ServerModel>().where(\.$id == server.id))
+                guard let editServer = transaction.edit(existingServer) else {
+                    logger.critical("Could not find server to add new url")
+                    throw JellyfinAPIError("An internal error has occurred")
+                }
+
+                editServer.urls.insert(server.currentURL)
+                editServer.currentURL = server.currentURL
+
+                return editServer.state
             }
-            .store(in: &cancellables)
-    }
 
-    func cancelConnection() {
-        for cancellable in cancellables {
-            cancellable.cancel()
+            Notifications[.didChangeCurrentServerURL].post(newState)
+        } catch {
+            logger.critical("\(error.localizedDescription)")
         }
-
-        self.isLoading = false
     }
 }

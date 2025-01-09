@@ -1,67 +1,99 @@
 //
- /*
-  * SwiftFin is subject to the terms of the Mozilla Public
-  * License, v2.0. If a copy of the MPL was not distributed with this
-  * file, you can obtain one at https://mozilla.org/MPL/2.0/.
-  *
-  * Copyright 2021 Aiden Vigue & Jellyfin Contributors
-  */
+// Swiftfin is subject to the terms of the Mozilla Public
+// License, v2.0. If a copy of the MPL was not distributed with this
+// file, you can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2025 Jellyfin & Jellyfin Contributors
+//
 
+import Factory
 import Foundation
 import Nuke
 import Stinsen
 import SwiftUI
 
+// TODO: clean up like iOS
+//       - move some things to App
+// TODO: server check flow
+
 final class MainCoordinator: NavigationCoordinatable {
-    var stack = NavigationStack<MainCoordinator>(initial: \MainCoordinator.mainTab)
 
-    @Root var mainTab = makeMainTab
-    @Root var serverList = makeServerList
-    @Root var liveTV = makeLiveTV
+    @Injected(\.logService)
+    private var logger
 
-    @ViewBuilder
-    func customize(_ view: AnyView) -> some View {
-        view.background {
-            Color.black
-                .ignoresSafeArea()
-        }
-    }
+    var stack: Stinsen.NavigationStack<MainCoordinator>
+
+    @Root
+    var loading = makeLoading
+    @Root
+    var mainTab = makeMainTab
+    @Root
+    var selectUser = makeSelectUser
 
     init() {
-        if SessionManager.main.currentLogin != nil {
-            self.stack = NavigationStack(initial: \MainCoordinator.mainTab)
-        } else {
-            self.stack = NavigationStack(initial: \MainCoordinator.serverList)
+
+        stack = NavigationStack(initial: \.loading)
+
+        Task {
+            do {
+                try await SwiftfinStore.setupDataStack()
+
+                if Container.shared.currentUserSession() != nil {
+                    await MainActor.run {
+                        withAnimation(.linear(duration: 0.1)) {
+                            let _ = root(\.mainTab)
+                        }
+                    }
+                } else {
+                    await MainActor.run {
+                        withAnimation(.linear(duration: 0.1)) {
+                            let _ = root(\.selectUser)
+                        }
+                    }
+                }
+
+            } catch {
+                await MainActor.run {
+                    logger.critical("\(error.localizedDescription)")
+                    Notifications[.didFailMigration].post()
+                }
+            }
         }
 
-        ImageCache.shared.costLimit = 125 * 1024 * 1024 // 125MB memory
-        DataLoader.sharedUrlCache.diskCapacity = 1000 * 1024 * 1024 // 1000MB disk
-
         // Notification setup for state
-        let nc = SwiftfinNotificationCenter.main
-        nc.addObserver(self, selector: #selector(didLogIn), name: SwiftfinNotificationCenter.Keys.didSignIn, object: nil)
-        nc.addObserver(self, selector: #selector(didLogOut), name: SwiftfinNotificationCenter.Keys.didSignOut, object: nil)
+        Notifications[.didSignIn].subscribe(self, selector: #selector(didSignIn))
+        Notifications[.didSignOut].subscribe(self, selector: #selector(didSignOut))
     }
 
-    @objc func didLogIn() {
-        LogManager.shared.log.info("Received `didSignIn` from NSNotificationCenter.")
-        root(\.mainTab)
+    @objc
+    func didSignIn() {
+        logger.info("Signed in")
+
+        withAnimation(.linear(duration: 0.1)) {
+            let _ = root(\.mainTab)
+        }
     }
 
-    @objc func didLogOut() {
-        LogManager.shared.log.info("Received `didSignOut` from NSNotificationCenter.")
-        root(\.serverList)
+    @objc
+    func didSignOut() {
+        logger.info("Signed out")
+
+        withAnimation(.linear(duration: 0.1)) {
+            let _ = root(\.selectUser)
+        }
+    }
+
+    func makeLoading() -> NavigationViewCoordinator<BasicNavigationViewCoordinator> {
+        NavigationViewCoordinator {
+            AppLoadingView()
+        }
     }
 
     func makeMainTab() -> MainTabCoordinator {
         MainTabCoordinator()
     }
 
-    func makeServerList() -> NavigationViewCoordinator<ServerListCoordinator> {
-        NavigationViewCoordinator(ServerListCoordinator())
-    }
-
-    func makeLiveTV() -> LiveTVTabCoordinator {
-        LiveTVTabCoordinator()
+    func makeSelectUser() -> NavigationViewCoordinator<SelectUserCoordinator> {
+        NavigationViewCoordinator(SelectUserCoordinator())
     }
 }
